@@ -437,15 +437,15 @@ function resetConnectionState() {
 /**
  * Routes incoming packets by type:
  *   file-meta  → stores metadata, shows progress bar
- *   ArrayBuffer→ buffers the chunk, updates progress
+ *   ArrayBuffer/Uint8Array/Blob → buffers the chunk, updates progress
  *   eof        → assembles Blob, triggers auto-download
  *
- * @param {object|ArrayBuffer} data
+ * @param {object|ArrayBuffer|Uint8Array|Blob} data
  */
 function handleIncomingData(data) {
 
   // ── 1. Metadata packet ────────────────────────────────────────
-  if (data && typeof data === 'object' && !(data instanceof ArrayBuffer) && data.type === 'file-meta') {
+  if (data && typeof data === 'object' && !(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data) && !(data instanceof Blob) && data.type === 'file-meta') {
     incomingMeta   = { name: data.name, mimeType: data.mimeType, size: data.size };
     receivedChunks = [];
     receivedBytes  = 0;
@@ -455,24 +455,29 @@ function handleIncomingData(data) {
     return;
   }
 
-  // ── 2. Binary chunk (ArrayBuffer) ─────────────────────────────
-  if (data instanceof ArrayBuffer) {
+  // ── 2. Binary chunk (ArrayBuffer, Uint8Array, or Blob) ────────
+  if (data instanceof ArrayBuffer || ArrayBuffer.isView(data) || data instanceof Blob) {
     if (!incomingMeta) {
       log('Received chunk before metadata — ignoring orphaned packet.', 'warn');
       return;
     }
 
+    // byteLength works for ArrayBuffer/TypedArray, size works for Blob
+    const chunkSize = data.byteLength !== undefined ? data.byteLength : (data.size || 0);
+    
     receivedChunks.push(data);
-    receivedBytes += data.byteLength;
+    receivedBytes += chunkSize;
 
-    const pct = Math.min(100, Math.round((receivedBytes / incomingMeta.size) * 100));
+    // Avoid 0/0 division NaN issue for 0-byte files
+    const pct = incomingMeta.size === 0 ? 100 : Math.min(100, Math.round((receivedBytes / incomingMeta.size) * 100));
     updateProgressBar(pct, 'Receiving…');
     return;
   }
 
   // ── 3. EOF sentinel ───────────────────────────────────────────
-  if (data && typeof data === 'object' && !(data instanceof ArrayBuffer) && data.type === 'eof') {
-    if (!incomingMeta || receivedChunks.length === 0) {
+  if (data && typeof data === 'object' && !(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data) && !(data instanceof Blob) && data.type === 'eof') {
+    // Only fail if there are no chunks AND the file size was larger than 0
+    if (!incomingMeta || (receivedChunks.length === 0 && incomingMeta.size > 0)) {
       log('Received EOF signal but no data was buffered.', 'warn');
       return;
     }
@@ -585,19 +590,24 @@ async function sendFile(file, connection) {
     const totalChunks = Math.ceil(arrayBuffer.byteLength / CHUNK_SIZE);
     let sentBytes = 0;
 
-    for (let i = 0; i < totalChunks; i++) {
-      const start = i * CHUNK_SIZE;
-      const end   = Math.min(start + CHUNK_SIZE, arrayBuffer.byteLength);
-      const chunk = arrayBuffer.slice(start, end);
+    if (totalChunks > 0) {
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end   = Math.min(start + CHUNK_SIZE, arrayBuffer.byteLength);
+        const chunk = arrayBuffer.slice(start, end);
 
-      connection.send(chunk);
-      sentBytes += chunk.byteLength;
+        connection.send(chunk);
+        sentBytes += chunk.byteLength;
 
-      const pct = Math.min(100, Math.round((sentBytes / file.size) * 100));
-      updateProgressBar(pct, 'Sending…');
+        const pct = Math.min(100, Math.round((sentBytes / file.size) * 100));
+        updateProgressBar(pct, 'Sending…');
 
-      // Yield every ~1 MB to keep the UI and WebRTC buffer healthy
-      if ((i + 1) % 16 === 0) await yieldToEventLoop();
+        // Yield every ~1 MB to keep the UI and WebRTC buffer healthy
+        if ((i + 1) % 16 === 0) await yieldToEventLoop();
+      }
+    } else {
+      // Handle zero-byte files (No chunks will be sent, only metadata & EOF)
+      updateProgressBar(100, 'Sending…');
     }
 
     // Phase 4 — EOF sentinel
